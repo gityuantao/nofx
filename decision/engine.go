@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
@@ -36,6 +37,9 @@ type PositionInfo struct {
 	LiquidationPrice float64 `json:"liquidation_price"`
 	MarginUsed       float64 `json:"margin_used"`
 	UpdateTime       int64   `json:"update_time"` // 持仓更新时间戳（毫秒）
+	StopLossPrice    float64 `json:"stop_loss_price,omitempty"`    // 当前止损价格（如果已设置）
+	TakeProfitPrice  float64 `json:"take_profit_price,omitempty"` // 当前止盈价格（如果已设置）
+	MaxProfitPct     float64 `json:"max_profit_pct,omitempty"`     // 持仓期间最高盈利百分比（用于判断回撤）
 }
 
 // AccountInfo 账户信息
@@ -123,9 +127,12 @@ func GetFullDecisionWithCustomPrompt(ctx *Context, mcpClient *mcp.Client, custom
 		return nil, fmt.Errorf("获取市场数据失败: %w", err)
 	}
 
-	// 2. 构建 System Prompt（固定规则）和 User Prompt（动态数据）
+	// 2. 搜索重大事件（使用AI自动搜索）
+	majorEvents := searchMajorEvents(mcpClient, ctx.CurrentTime)
+
+	// 3. 构建 System Prompt（固定规则）和 User Prompt（动态数据）
 	systemPrompt := buildSystemPromptWithCustom(ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage, customPrompt, overrideBase, templateName)
-	userPrompt := buildUserPrompt(ctx)
+	userPrompt := buildUserPrompt(ctx, majorEvents)
 
 	// 3. 调用AI API（使用 system + user prompt）
 	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
@@ -332,19 +339,113 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	return sb.String()
 }
 
+// searchMajorEvents 使用AI搜索重大事件（如美联储会议、重大公告等）
+// 注意：此函数会临时修改客户端的超时设置，搜索完成后会恢复原始设置
+func searchMajorEvents(mcpClient *mcp.Client, currentTime string) string {
+	// 如果MCP客户端未配置，返回空字符串
+	if mcpClient == nil || mcpClient.APIKey == "" {
+		return ""
+	}
+
+	// 构建搜索提示词
+	systemPrompt := "你是一个专业的金融事件分析师。请根据当前日期，搜索并总结近期（未来7天内）可能影响加密货币市场的重大事件。"
+	userPrompt := fmt.Sprintf(`请搜索并总结当前日期（%s）附近（未来7天内）可能影响加密货币市场的重大事件，包括但不限于：
+1. 美联储（Fed）会议、利率决议
+2. 美国CPI、非农就业数据等重要经济指标发布
+3. 加密货币相关的重大监管公告
+4. 主要加密货币交易所的重大公告
+5. 其他可能影响市场的重要事件
+
+请以简洁的格式输出，如果没有发现重大事件，请说明"未发现近期重大事件"。
+
+格式示例：
+- 2024年X月X日：美联储利率决议
+- 2024年X月X日：美国CPI数据发布
+- 未发现近期重大事件`, currentTime)
+
+	// 创建临时客户端副本，使用较短的超时避免影响主流程
+	// 注意：由于MCP客户端结构体可能包含其他字段，我们只修改超时并恢复
+	originalTimeout := mcpClient.Timeout
+	mcpClient.Timeout = 30 * time.Second // 搜索使用30秒超时
+	defer func() {
+		mcpClient.Timeout = originalTimeout // 恢复原始超时
+	}()
+
+	result, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+	if err != nil {
+		log.Printf("⚠️  搜索重大事件失败: %v", err)
+		return ""
+	}
+
+	return result
+}
+
 // buildUserPrompt 构建 User Prompt（动态数据）
-func buildUserPrompt(ctx *Context) string {
+func buildUserPrompt(ctx *Context, majorEvents string) string {
 	var sb strings.Builder
 
 	// 系统状态
 	sb.WriteString(fmt.Sprintf("时间: %s | 周期: #%d | 运行: %d分钟\n\n",
 		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
 
-	// BTC 市场
+	// BTC 市场（多周期MACD）
 	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
-		sb.WriteString(fmt.Sprintf("BTC: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
-			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h,
-			btcData.CurrentMACD, btcData.CurrentRSI7))
+		sb.WriteString("## BTC 市场状态（市场领导者）\n\n")
+		sb.WriteString(fmt.Sprintf("价格: %.2f (1h: %+.2f%%, 4h: %+.2f%%, 24h: %+.2f%%)\n", 
+			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h, btcData.PriceChange24h))
+		
+		// 多周期MACD（用于BTC状态确认）
+		sb.WriteString("多周期MACD方向:\n")
+		sb.WriteString(fmt.Sprintf("- 3分钟MACD: %.4f %s\n", btcData.CurrentMACD, getMACDDirection(btcData.CurrentMACD)))
+		if btcData.MACD_15m != 0 {
+			sb.WriteString(fmt.Sprintf("- 15分钟MACD: %.4f %s\n", btcData.MACD_15m, getMACDDirection(btcData.MACD_15m)))
+		}
+		if btcData.MACD_1h != 0 {
+			sb.WriteString(fmt.Sprintf("- 1小时MACD: %.4f %s\n", btcData.MACD_1h, getMACDDirection(btcData.MACD_1h)))
+		}
+		// 4小时MACD从LongerTermContext获取
+		if btcData.LongerTermContext != nil && len(btcData.LongerTermContext.MACDValues) > 0 {
+			macd4h := btcData.LongerTermContext.MACDValues[len(btcData.LongerTermContext.MACDValues)-1]
+			sb.WriteString(fmt.Sprintf("- 4小时MACD: %.4f %s\n", macd4h, getMACDDirection(macd4h)))
+		}
+		sb.WriteString(fmt.Sprintf("- RSI: %.2f\n", btcData.CurrentRSI7))
+		
+		// BTC特殊情况检查（用于BTC状态确认）
+		sb.WriteString("\n⚠️ **BTC特殊情况检查**（用于第5步：BTC状态确认）:\n")
+		// 整数关口距离
+		if btcData.IntegerLevelDistance < 999 {
+			sb.WriteString(fmt.Sprintf("- 整数关口距离: %.2f%%", btcData.IntegerLevelDistance))
+			if btcData.IsNearIntegerLevel {
+				sb.WriteString(" ❌ **处于整数关口±2%（高度不确定）**\n")
+			} else {
+				sb.WriteString(" ✅ 不在整数关口附近\n")
+			}
+		}
+		// 单日波动率
+		if btcData.PriceChange24h != 0 {
+			sb.WriteString(fmt.Sprintf("- 单日波动率: %.2f%%", math.Abs(btcData.PriceChange24h)))
+			if math.Abs(btcData.PriceChange24h) > 5.0 {
+				sb.WriteString(" ❌ **单日波动 >5%（市场剧烈震荡）**\n")
+			} else {
+				sb.WriteString(" ✅ 单日波动 ≤5%\n")
+			}
+		}
+		// 1小时波动率
+		if btcData.Volatility1h > 0 {
+			sb.WriteString(fmt.Sprintf("- 1小时波动率: %.2f%%", btcData.Volatility1h))
+			if btcData.Volatility1h < 1.0 {
+				sb.WriteString(" ⚠️ **1小时波动 <1%（极端震荡，连续wait≥30次时需要检查）**\n")
+			} else {
+				sb.WriteString(" ✅ 1小时波动 ≥1%\n")
+			}
+		}
+		// 关键技术位突破状态
+		if btcData.IsKeyLevelBreakout {
+			sb.WriteString("- 关键技术位突破: ❌ **刚突破/跌破关键技术位（等待确认）**\n")
+		} else {
+			sb.WriteString("- 关键技术位突破: ✅ 未刚突破/跌破关键技术位\n")
+		}
+		sb.WriteString("\n")
 	}
 
 	// 账户
@@ -374,10 +475,61 @@ func buildUserPrompt(ctx *Context) string {
 				}
 			}
 
-			sb.WriteString(fmt.Sprintf("%d. %s %s | 入场价%.4f 当前价%.4f | 盈亏%+.2f%% | 杠杆%dx | 保证金%.0f | 强平价%.4f%s\n\n",
+			// 计算清算距离（百分比）
+			liquidationDistance := 0.0
+			if pos.LiquidationPrice > 0 && pos.EntryPrice > 0 {
+				if pos.Side == "long" {
+					liquidationDistance = ((pos.EntryPrice - pos.LiquidationPrice) / pos.EntryPrice) * 100
+				} else {
+					liquidationDistance = ((pos.LiquidationPrice - pos.EntryPrice) / pos.EntryPrice) * 100
+				}
+			}
+
+			// 计算手续费率（Binance期货maker: 0.02%, taker: 0.04%，取平均值0.03%）
+			feeRate := 0.0003 // 0.03%
+			// 计算清算价格（如果未提供）
+			calculatedLiquidationPrice := pos.LiquidationPrice
+			if calculatedLiquidationPrice <= 0 && pos.EntryPrice > 0 && pos.Leverage > 0 {
+				// 估算清算价格：做多时 = 入场价 * (1 - 1/杠杆)，做空时 = 入场价 * (1 + 1/杠杆)
+				if pos.Side == "long" {
+					calculatedLiquidationPrice = pos.EntryPrice * (1.0 - 1.0/float64(pos.Leverage))
+				} else {
+					calculatedLiquidationPrice = pos.EntryPrice * (1.0 + 1.0/float64(pos.Leverage))
+				}
+			}
+			// 重新计算清算距离（使用计算出的清算价格）
+			if calculatedLiquidationPrice > 0 && pos.EntryPrice > 0 {
+				if pos.Side == "long" {
+					liquidationDistance = ((pos.EntryPrice - calculatedLiquidationPrice) / pos.EntryPrice) * 100
+				} else {
+					liquidationDistance = ((calculatedLiquidationPrice - pos.EntryPrice) / pos.EntryPrice) * 100
+				}
+			}
+
+			// 构建持仓信息字符串
+			positionInfo := fmt.Sprintf("%d. %s %s | 入场价%.4f 当前价%.4f | 盈亏%+.2f%%", 
 				i+1, pos.Symbol, strings.ToUpper(pos.Side),
-				pos.EntryPrice, pos.MarkPrice, pos.UnrealizedPnLPct,
-				pos.Leverage, pos.MarginUsed, pos.LiquidationPrice, holdingDuration))
+				pos.EntryPrice, pos.MarkPrice, pos.UnrealizedPnLPct)
+			
+			// 添加最高盈利信息（如果存在且与当前盈利不同）
+			if pos.MaxProfitPct > 0 && pos.MaxProfitPct > pos.UnrealizedPnLPct {
+				drawdown := pos.MaxProfitPct - pos.UnrealizedPnLPct
+				positionInfo += fmt.Sprintf(" | 最高盈利%.2f%% (回撤%.2f%%)", pos.MaxProfitPct, drawdown)
+			}
+			
+			// 添加止损/止盈价格
+			if pos.StopLossPrice > 0 {
+				positionInfo += fmt.Sprintf(" | 止损%.4f", pos.StopLossPrice)
+			}
+			if pos.TakeProfitPrice > 0 {
+				positionInfo += fmt.Sprintf(" | 止盈%.4f", pos.TakeProfitPrice)
+			}
+			
+			// 添加其他信息
+			positionInfo += fmt.Sprintf(" | 杠杆%dx | 保证金%.0f | 强平价%.4f | 清算距离%.2f%% | 手续费率%.4f%%%s\n\n",
+				pos.Leverage, pos.MarginUsed, calculatedLiquidationPrice, liquidationDistance, feeRate*100, holdingDuration)
+			
+			sb.WriteString(positionInfo)
 
 			// 使用FormatMarketData输出完整市场数据
 			if marketData, ok := ctx.MarketDataMap[pos.Symbol]; ok {
@@ -413,24 +565,234 @@ func buildUserPrompt(ctx *Context) string {
 	}
 	sb.WriteString("\n")
 
-	// 夏普比率（直接传值，不要复杂格式化）
+	// 交易表现和决策历史（直接传值，不要复杂格式化）
 	if ctx.Performance != nil {
-		// 直接从interface{}中提取SharpeRatio
+		// 直接从interface{}中提取数据
 		type PerformanceData struct {
-			SharpeRatio float64 `json:"sharpe_ratio"`
+			SharpeRatio            float64                    `json:"sharpe_ratio"`
+			ConsecutiveWaits       int                       `json:"consecutive_waits"`
+			ConsecutiveLosses      int                       `json:"consecutive_losses"`
+			LastOpenTime           interface{}               `json:"last_open_time"` // time.Time 序列化为字符串
+			TimeSinceLastOpen      int                       `json:"time_since_last_open"`
+			LastStopLossTime       interface{}               `json:"last_stop_loss_time"`
+			TimeSinceLastStopLoss  int                       `json:"time_since_last_stop_loss"`
+			LastTakeProfitTime     interface{}               `json:"last_take_profit_time"`
+			TimeSinceLastTakeProfit int                      `json:"time_since_last_take_profit"`
+			DailyLossPercent       float64                   `json:"daily_loss_percent"`
+			RecentDecisions        []map[string]interface{}  `json:"recent_decisions"`
 		}
 		var perfData PerformanceData
 		if jsonData, err := json.Marshal(ctx.Performance); err == nil {
 			if err := json.Unmarshal(jsonData, &perfData); err == nil {
-				sb.WriteString(fmt.Sprintf("## 📊 夏普比率: %.2f\n\n", perfData.SharpeRatio))
+				sb.WriteString(fmt.Sprintf("## 📊 交易表现\n\n"))
+				sb.WriteString(fmt.Sprintf("夏普比率: %.2f\n", perfData.SharpeRatio))
+				
+				// 输出连续wait次数（重要：用于判断是否进入宽松模式）
+				if perfData.ConsecutiveWaits > 0 {
+					sb.WriteString(fmt.Sprintf("连续 Wait 次数: %d 次（%d 分钟）\n", perfData.ConsecutiveWaits, perfData.ConsecutiveWaits*3))
+					
+					// 根据连续wait次数提示进入的模式
+					if perfData.ConsecutiveWaits >= 30 {
+						sb.WriteString("⚠️ **强制评估模式**：连续 wait ≥30 次，请检查市场环境并考虑兜底机制\n")
+					} else if perfData.ConsecutiveWaits >= 20 {
+						sb.WriteString("⚠️ **极宽松模式**：连续 wait ≥20 次，已降低开仓标准（信心度 ≥75，2/4 周期同向，3/8 项一致）\n")
+					} else if perfData.ConsecutiveWaits >= 10 {
+						sb.WriteString("⚠️ **宽松模式**：连续 wait ≥10 次，已降低开仓标准（信心度 ≥80，2/4 周期同向，4/8 项一致）\n")
+					}
+				} else {
+					sb.WriteString("连续 Wait 次数: 0 次（正常模式）\n")
+				}
+
+				// 输出连续亏损次数（重要：用于判断是否触发暂停机制）
+				if perfData.ConsecutiveLosses > 0 {
+					sb.WriteString(fmt.Sprintf("连续亏损次数: %d 次", perfData.ConsecutiveLosses))
+					if perfData.ConsecutiveLosses >= 4 {
+						sb.WriteString(" ⚠️ **暂停交易 72 小时，需人工审查**\n")
+					} else if perfData.ConsecutiveLosses >= 3 {
+						sb.WriteString(" ⚠️ **暂停交易 24 小时**\n")
+					} else if perfData.ConsecutiveLosses >= 2 {
+						sb.WriteString(" ⚠️ **暂停交易 45 分钟（15 个周期）**\n")
+					} else {
+						sb.WriteString("\n")
+					}
+				} else {
+					sb.WriteString("连续亏损次数: 0 次\n")
+				}
+
+				// 输出上次开仓时间（重要：用于冷却期检查）
+				if perfData.TimeSinceLastOpen < 999 {
+					lastOpenTimeStr := ""
+					if perfData.LastOpenTime != nil {
+						switch v := perfData.LastOpenTime.(type) {
+						case string:
+							lastOpenTimeStr = v
+						case time.Time:
+							lastOpenTimeStr = v.Format("2006-01-02 15:04:05")
+						default:
+							lastOpenTimeStr = fmt.Sprintf("%v", v)
+						}
+					}
+					if lastOpenTimeStr == "" {
+						lastOpenTimeStr = "未知"
+					}
+					sb.WriteString(fmt.Sprintf("上次开仓时间: %s（%d 分钟前）\n", lastOpenTimeStr, perfData.TimeSinceLastOpen))
+					// 冷却期检查提示
+					if perfData.TimeSinceLastOpen < 9 {
+						sb.WriteString(fmt.Sprintf("⚠️ **冷却期中**：距上次开仓仅 %d 分钟，需等待 ≥9 分钟\n", perfData.TimeSinceLastOpen))
+					}
+				} else {
+					sb.WriteString("上次开仓时间: 无（从未开仓或历史记录不足）\n")
+				}
+
+				// 输出上次止损时间（重要：用于冷却期检查）
+				if perfData.TimeSinceLastStopLoss < 999 {
+					lastStopLossTimeStr := ""
+					if perfData.LastStopLossTime != nil {
+						switch v := perfData.LastStopLossTime.(type) {
+						case string:
+							lastStopLossTimeStr = v
+						case time.Time:
+							lastStopLossTimeStr = v.Format("2006-01-02 15:04:05")
+						default:
+							lastStopLossTimeStr = fmt.Sprintf("%v", v)
+						}
+					}
+					if lastStopLossTimeStr == "" {
+						lastStopLossTimeStr = "未知"
+					}
+					sb.WriteString(fmt.Sprintf("上次止损时间: %s（%d 分钟前）\n", lastStopLossTimeStr, perfData.TimeSinceLastStopLoss))
+					// 冷却期检查提示
+					if perfData.TimeSinceLastStopLoss < 6 {
+						sb.WriteString(fmt.Sprintf("⚠️ **冷却期中**：距上次止损仅 %d 分钟，需等待 ≥6 分钟\n", perfData.TimeSinceLastStopLoss))
+					}
+				} else {
+					sb.WriteString("上次止损时间: 无（从未止损或历史记录不足）\n")
+				}
+
+				// 输出上次止盈时间（重要：用于冷却期检查）
+				if perfData.TimeSinceLastTakeProfit < 999 {
+					lastTakeProfitTimeStr := ""
+					if perfData.LastTakeProfitTime != nil {
+						switch v := perfData.LastTakeProfitTime.(type) {
+						case string:
+							lastTakeProfitTimeStr = v
+						case time.Time:
+							lastTakeProfitTimeStr = v.Format("2006-01-02 15:04:05")
+						default:
+							lastTakeProfitTimeStr = fmt.Sprintf("%v", v)
+						}
+					}
+					if lastTakeProfitTimeStr == "" {
+						lastTakeProfitTimeStr = "未知"
+					}
+					sb.WriteString(fmt.Sprintf("上次止盈时间: %s（%d 分钟前）\n", lastTakeProfitTimeStr, perfData.TimeSinceLastTakeProfit))
+					// 冷却期检查提示
+					if perfData.TimeSinceLastTakeProfit < 3 {
+						sb.WriteString(fmt.Sprintf("⚠️ **冷却期中**：距上次止盈仅 %d 分钟，需等待 ≥3 分钟（若想同方向再入场）\n", perfData.TimeSinceLastTakeProfit))
+					}
+				} else {
+					sb.WriteString("上次止盈时间: 无（从未止盈或历史记录不足）\n")
+				}
+
+				// 输出单日亏损百分比（重要：用于连续亏损检查）
+				if perfData.DailyLossPercent < 0 {
+					sb.WriteString(fmt.Sprintf("单日亏损百分比: %.2f%%", perfData.DailyLossPercent))
+					if perfData.DailyLossPercent < -5.0 {
+						sb.WriteString(" ⚠️ **立即停止交易，等待人工介入**\n")
+					} else {
+						sb.WriteString("\n")
+					}
+				} else {
+					sb.WriteString(fmt.Sprintf("单日亏损百分比: %.2f%%（今日盈利或持平）\n", perfData.DailyLossPercent))
+				}
+
+				// 输出最近决策历史（用于判断连续wait和恢复条件）
+				if len(perfData.RecentDecisions) > 0 {
+					sb.WriteString("\n最近决策历史（最新 → 最旧）:\n")
+					maxShow := 10
+					if len(perfData.RecentDecisions) < maxShow {
+						maxShow = len(perfData.RecentDecisions)
+					}
+					// 去重：使用map记录已显示的周期编号
+					seenCycles := make(map[int]bool)
+					shownCount := 0
+					for i := 0; i < len(perfData.RecentDecisions) && shownCount < maxShow; i++ {
+						dec := perfData.RecentDecisions[i]
+						cycleNum := 0
+						action := "wait"
+						if c, ok := dec["cycle_number"].(float64); ok {
+							cycleNum = int(c)
+						}
+						if a, ok := dec["action"].(string); ok {
+							action = a
+						}
+						// 只显示未重复的周期
+						if !seenCycles[cycleNum] {
+							sb.WriteString(fmt.Sprintf("  #%d: %s\n", cycleNum, action))
+							seenCycles[cycleNum] = true
+							shownCount++
+						}
+					}
+				}
+				sb.WriteString("\n")
 			}
 		}
+	}
+
+	// 输出手续费率信息（用于计算"预计收益 > 手续费 ×3"）
+	sb.WriteString("---\n\n")
+	sb.WriteString("## 💰 交易成本信息\n\n")
+	sb.WriteString("手续费率: 0.03% (Binance期货平均费率，maker: 0.02%, taker: 0.04%)\n")
+	sb.WriteString("滑点缓冲: 0.01-0.1% (取决于仓位大小)\n")
+	sb.WriteString("⚠️ **收益检查**：预期收益必须 > (手续费 + 滑点) × 3\n\n")
+
+	// 输出市场环境信息（用于长时间Wait后的阈值调整）
+	sb.WriteString("## 🌍 市场环境信息（用于第0.5步：长时间Wait后的阈值调整）\n\n")
+	now := time.Now()
+	weekday := now.Weekday()
+	hour := now.Hour()
+	
+	// 判断是否周末
+	isWeekend := weekday == time.Saturday || weekday == time.Sunday
+	if isWeekend {
+		sb.WriteString("⚠️ **低流动性时段**：当前是周末，市场流动性可能较低\n")
+	} else {
+		sb.WriteString("✅ 工作日（流动性正常）\n")
+	}
+	
+	// 判断是否深夜（UTC时间，需要根据实际情况调整）
+	// 假设UTC+8时区，深夜为0-6点
+	isLateNight := hour >= 0 && hour < 6
+	if isLateNight {
+		sb.WriteString("⚠️ **低流动性时段**：当前是深夜（0-6点），市场流动性可能较低\n")
+	} else {
+		sb.WriteString("✅ 正常交易时段\n")
+	}
+	
+	// 重大事件（AI自动搜索）
+	sb.WriteString("## 📅 重大事件检查\n\n")
+	if majorEvents != "" {
+		sb.WriteString("✅ **AI已自动搜索重大事件**：\n")
+		sb.WriteString(majorEvents)
+		sb.WriteString("\n\n")
+	} else {
+		sb.WriteString("⚠️ **重大事件检查**：AI搜索失败或未配置，请手动检查是否有重大事件（如美联储会议、重大公告）\n\n")
 	}
 
 	sb.WriteString("---\n\n")
 	sb.WriteString("现在请分析并输出决策（思维链 + JSON）\n")
 
 	return sb.String()
+}
+
+// getMACDDirection 获取MACD方向描述
+func getMACDDirection(macd float64) string {
+	if macd > 0 {
+		return "(多头)"
+	} else if macd < 0 {
+		return "(空头)"
+	}
+	return "(中性)"
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
@@ -589,14 +951,62 @@ func validateJSONFormat(jsonStr string) error {
 	}
 
 	// 检查是否包含千位分隔符（如 98,000）
-	// 使用简单的模式匹配：数字+逗号+3位数字
+	// ⚠️ 重要：只在JSON数字值中检查，不在字符串值中检查
+	// 使用正则表达式匹配JSON数字中的千位分隔符（不在引号内）
+	// 匹配模式：数字+逗号+3位数字，但不在引号内
+	inString := false
+	escapeNext := false
 	for i := 0; i < len(jsonStr)-4; i++ {
-		if jsonStr[i] >= '0' && jsonStr[i] <= '9' &&
-			jsonStr[i+1] == ',' &&
-			jsonStr[i+2] >= '0' && jsonStr[i+2] <= '9' &&
-			jsonStr[i+3] >= '0' && jsonStr[i+3] <= '9' &&
-			jsonStr[i+4] >= '0' && jsonStr[i+4] <= '9' {
-			return fmt.Errorf("JSON 数字不可包含千位分隔符逗号，发现: %s", jsonStr[i:min(i+10, len(jsonStr))])
+		// 处理转义字符
+		if escapeNext {
+			escapeNext = false
+			continue
+		}
+		if jsonStr[i] == '\\' {
+			escapeNext = true
+			continue
+		}
+		// 跟踪是否在字符串内
+		if jsonStr[i] == '"' {
+			inString = !inString
+			continue
+		}
+		// 只在非字符串区域检查千位分隔符
+		if !inString {
+			// 检查是否是数字+逗号+3位数字的模式
+			// 但需要确保这是JSON数字的一部分，不是对象/数组分隔符
+			if jsonStr[i] >= '0' && jsonStr[i] <= '9' &&
+				jsonStr[i+1] == ',' &&
+				jsonStr[i+2] >= '0' && jsonStr[i+2] <= '9' &&
+				jsonStr[i+3] >= '0' && jsonStr[i+3] <= '9' &&
+				jsonStr[i+4] >= '0' && jsonStr[i+4] <= '9' {
+				// 检查前后文，确保这是数字的一部分（不是对象/数组分隔符）
+				// 前面应该是数字、小数点、负号、空格、冒号、逗号、左括号
+				// 后面应该是数字、小数点、空格、逗号、右括号
+				prevOK := i == 0 || 
+					jsonStr[i-1] >= '0' && jsonStr[i-1] <= '9' ||
+					jsonStr[i-1] == '.' ||
+					jsonStr[i-1] == '-' ||
+					jsonStr[i-1] == ' ' ||
+					jsonStr[i-1] == '\t' ||
+					jsonStr[i-1] == ':' ||
+					jsonStr[i-1] == ',' ||
+					jsonStr[i-1] == '[' ||
+					jsonStr[i-1] == '{'
+				nextOK := i+5 >= len(jsonStr) ||
+					jsonStr[i+5] >= '0' && jsonStr[i+5] <= '9' ||
+					jsonStr[i+5] == '.' ||
+					jsonStr[i+5] == ' ' ||
+					jsonStr[i+5] == '\t' ||
+					jsonStr[i+5] == ',' ||
+					jsonStr[i+5] == '}' ||
+					jsonStr[i+5] == ']' ||
+					jsonStr[i+5] == '\n' ||
+					jsonStr[i+5] == '\r'
+				if prevOK && nextOK {
+					return fmt.Errorf("JSON 数字不可包含千位分隔符逗号，发现: %s", jsonStr[i:min(i+10, len(jsonStr))])
+				}
+			}
 		}
 	}
 
