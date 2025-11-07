@@ -289,20 +289,39 @@ type TradeOutcome struct {
 	WasStopLoss   bool      `json:"was_stop_loss"`  // 是否止损
 }
 
+// RecentDecision 最近决策记录（用于判断连续wait）
+type RecentDecision struct {
+	CycleNumber int       `json:"cycle_number"` // 周期编号
+	Timestamp   time.Time `json:"timestamp"`     // 决策时间
+	Action      string    `json:"action"`        // 主要动作（wait/open_long/open_short/hold/close等）
+	HasOpen     bool      `json:"has_open"`      // 是否有开仓操作
+	HasClose    bool      `json:"has_close"`     // 是否有平仓操作
+}
+
 // PerformanceAnalysis 交易表现分析
 type PerformanceAnalysis struct {
-	TotalTrades   int                           `json:"total_trades"`   // 总交易数
-	WinningTrades int                           `json:"winning_trades"` // 盈利交易数
-	LosingTrades  int                           `json:"losing_trades"`  // 亏损交易数
-	WinRate       float64                       `json:"win_rate"`       // 胜率
-	AvgWin        float64                       `json:"avg_win"`        // 平均盈利
-	AvgLoss       float64                       `json:"avg_loss"`       // 平均亏损
-	ProfitFactor  float64                       `json:"profit_factor"`  // 盈亏比
-	SharpeRatio   float64                       `json:"sharpe_ratio"`   // 夏普比率（风险调整后收益）
-	RecentTrades  []TradeOutcome                `json:"recent_trades"`  // 最近N笔交易
-	SymbolStats   map[string]*SymbolPerformance `json:"symbol_stats"`   // 各币种表现
-	BestSymbol    string                        `json:"best_symbol"`    // 表现最好的币种
-	WorstSymbol   string                        `json:"worst_symbol"`   // 表现最差的币种
+	TotalTrades        int                           `json:"total_trades"`         // 总交易数
+	WinningTrades      int                           `json:"winning_trades"`       // 盈利交易数
+	LosingTrades       int                           `json:"losing_trades"`        // 亏损交易数
+	WinRate            float64                       `json:"win_rate"`             // 胜率
+	AvgWin             float64                       `json:"avg_win"`              // 平均盈利
+	AvgLoss            float64                       `json:"avg_loss"`             // 平均亏损
+	ProfitFactor       float64                       `json:"profit_factor"`        // 盈亏比
+	SharpeRatio        float64                       `json:"sharpe_ratio"`         // 夏普比率（风险调整后收益）
+	RecentTrades       []TradeOutcome                `json:"recent_trades"`         // 最近N笔交易
+	RecentDecisions    []RecentDecision              `json:"recent_decisions"`     // 最近N次决策（用于判断连续wait）
+	ConsecutiveWaits   int                           `json:"consecutive_waits"`    // 连续wait次数
+	ConsecutiveLosses  int                           `json:"consecutive_losses"`   // 连续亏损次数
+	LastOpenTime       time.Time                     `json:"last_open_time"`       // 上次开仓时间
+	TimeSinceLastOpen  int                           `json:"time_since_last_open"` // 距上次开仓时间（分钟）
+	LastStopLossTime   time.Time                     `json:"last_stop_loss_time"`  // 上次止损时间
+	TimeSinceLastStopLoss int                        `json:"time_since_last_stop_loss"` // 距上次止损时间（分钟）
+	LastTakeProfitTime time.Time                     `json:"last_take_profit_time"` // 上次止盈时间
+	TimeSinceLastTakeProfit int                      `json:"time_since_last_take_profit"` // 距上次止盈时间（分钟）
+	DailyLossPercent   float64                       `json:"daily_loss_percent"`   // 单日亏损百分比
+	SymbolStats        map[string]*SymbolPerformance `json:"symbol_stats"`         // 各币种表现
+	BestSymbol         string                        `json:"best_symbol"`           // 表现最好的币种
+	WorstSymbol        string                        `json:"worst_symbol"`         // 表现最差的币种
 }
 
 // SymbolPerformance 币种表现统计
@@ -325,14 +344,34 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 
 	if len(records) == 0 {
 		return &PerformanceAnalysis{
-			RecentTrades: []TradeOutcome{},
-			SymbolStats:  make(map[string]*SymbolPerformance),
+			RecentTrades:            []TradeOutcome{},
+			RecentDecisions:         []RecentDecision{},
+			ConsecutiveWaits:        0,
+			ConsecutiveLosses:       0,
+			LastOpenTime:            time.Time{},
+			TimeSinceLastOpen:       999,
+			LastStopLossTime:        time.Time{},
+			TimeSinceLastStopLoss:   999,
+			LastTakeProfitTime:      time.Time{},
+			TimeSinceLastTakeProfit: 999,
+			DailyLossPercent:        0.0,
+			SymbolStats:             make(map[string]*SymbolPerformance),
 		}, nil
 	}
 
 	analysis := &PerformanceAnalysis{
-		RecentTrades: []TradeOutcome{},
-		SymbolStats:  make(map[string]*SymbolPerformance),
+		RecentTrades:            []TradeOutcome{},
+		RecentDecisions:         []RecentDecision{},
+		ConsecutiveWaits:        0,
+		ConsecutiveLosses:       0,
+		LastOpenTime:            time.Time{},
+		TimeSinceLastOpen:       999,
+		LastStopLossTime:        time.Time{},
+		TimeSinceLastStopLoss:   999,
+		LastTakeProfitTime:      time.Time{},
+		TimeSinceLastTakeProfit: 999,
+		DailyLossPercent:        0.0,
+		SymbolStats:             make(map[string]*SymbolPerformance),
 	}
 
 	// 追踪持仓状态：symbol_side -> {side, openPrice, openTime, quantity, leverage}
@@ -654,6 +693,182 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 		for i, j := 0, len(analysis.RecentTrades)-1; i < j; i, j = i+1, j-1 {
 			analysis.RecentTrades[i], analysis.RecentTrades[j] = analysis.RecentTrades[j], analysis.RecentTrades[i]
 		}
+	}
+
+	// 分析最近决策历史（用于判断连续wait）
+	analysis.RecentDecisions = make([]RecentDecision, 0)
+	analysis.ConsecutiveWaits = 0
+	
+	// 从最新到最旧遍历记录（records已经是从旧到新，需要反转）
+	reversedRecords := make([]*DecisionRecord, len(records))
+	for i := 0; i < len(records); i++ {
+		reversedRecords[i] = records[len(records)-1-i]
+	}
+	
+	// 分析最近30次决策（最多）
+	maxDecisions := 30
+	if len(reversedRecords) > maxDecisions {
+		reversedRecords = reversedRecords[:maxDecisions]
+	}
+	
+	for _, record := range reversedRecords {
+		// 判断主要动作
+		hasOpen := false
+		hasClose := false
+		mainAction := "wait"
+		
+		for _, action := range record.Decisions {
+			if action.Action == "open_long" || action.Action == "open_short" {
+				hasOpen = true
+				mainAction = action.Action
+			} else if action.Action == "close_long" || action.Action == "close_short" || 
+			          action.Action == "auto_close_long" || action.Action == "auto_close_short" {
+				hasClose = true
+				if mainAction == "wait" {
+					mainAction = action.Action
+				}
+			} else if action.Action == "hold" && mainAction == "wait" {
+				mainAction = "hold"
+			}
+		}
+		
+		// 如果没有开仓也没有平仓，且没有hold，则认为是wait
+		if !hasOpen && !hasClose && mainAction == "wait" {
+			// 检查是否有持仓（如果有持仓且没有操作，可能是hold）
+			if len(record.Positions) > 0 {
+				mainAction = "hold"
+			}
+		}
+		
+		analysis.RecentDecisions = append(analysis.RecentDecisions, RecentDecision{
+			CycleNumber: record.CycleNumber,
+			Timestamp:   record.Timestamp,
+			Action:      mainAction,
+			HasOpen:     hasOpen,
+			HasClose:    hasClose,
+		})
+	}
+	
+	// 计算连续wait次数（从最新开始往前数）
+	for i := 0; i < len(analysis.RecentDecisions); i++ {
+		decision := analysis.RecentDecisions[i]
+		// wait的定义：没有开仓操作，且主要动作是wait
+		if !decision.HasOpen && decision.Action == "wait" {
+			analysis.ConsecutiveWaits++
+		} else {
+			// 遇到非wait决策，停止计数
+			break
+		}
+	}
+
+	// 计算连续亏损次数（从最新开始往前数）
+	analysis.ConsecutiveLosses = 0
+	for i := 0; i < len(analysis.RecentTrades); i++ {
+		trade := analysis.RecentTrades[i]
+		if trade.PnL < 0 {
+			analysis.ConsecutiveLosses++
+		} else {
+			// 遇到盈利交易，停止计数
+			break
+		}
+	}
+
+	// 计算上次开仓时间和距离开仓时间
+	analysis.LastOpenTime = time.Time{}
+	analysis.TimeSinceLastOpen = 999 // 默认值，表示很久没开仓
+	for _, record := range reversedRecords {
+		for _, action := range record.Decisions {
+			if (action.Action == "open_long" || action.Action == "open_short") && action.Success {
+				analysis.LastOpenTime = action.Timestamp
+				timeSince := time.Since(action.Timestamp)
+				analysis.TimeSinceLastOpen = int(timeSince.Minutes())
+				goto foundLastOpen
+			}
+		}
+	}
+foundLastOpen:
+	// 注意：LastOpenTime 在 JSON 序列化时会自动转换为 RFC3339 格式字符串
+
+	// 计算上次止损时间和距止损时间
+	analysis.LastStopLossTime = time.Time{}
+	analysis.TimeSinceLastStopLoss = 999 // 默认值，表示很久没止损
+	for _, record := range reversedRecords {
+		for _, action := range record.Decisions {
+			// 检查是否是止损（通过检查WasStopLoss字段或通过价格判断）
+			// 如果action是close_long/close_short且PnL为负，可能是止损
+			if (action.Action == "close_long" || action.Action == "close_short" || 
+			    action.Action == "auto_close_long" || action.Action == "auto_close_short") && action.Success {
+				// 查找对应的交易结果来判断是否是止损
+				for _, trade := range analysis.RecentTrades {
+					if trade.CloseTime.Equal(action.Timestamp) && trade.WasStopLoss {
+						analysis.LastStopLossTime = action.Timestamp
+						timeSince := time.Since(action.Timestamp)
+						analysis.TimeSinceLastStopLoss = int(timeSince.Minutes())
+						goto foundLastStopLoss
+					}
+				}
+			}
+		}
+	}
+foundLastStopLoss:
+
+	// 计算上次止盈时间和距止盈时间
+	analysis.LastTakeProfitTime = time.Time{}
+	analysis.TimeSinceLastTakeProfit = 999 // 默认值，表示很久没止盈
+	for _, record := range reversedRecords {
+		for _, action := range record.Decisions {
+			// 检查是否是止盈（通过检查WasStopLoss字段为false且PnL为正）
+			if (action.Action == "close_long" || action.Action == "close_short" || 
+			    action.Action == "auto_close_long" || action.Action == "auto_close_short") && action.Success {
+				// 查找对应的交易结果来判断是否是止盈
+				for _, trade := range analysis.RecentTrades {
+					if trade.CloseTime.Equal(action.Timestamp) && !trade.WasStopLoss && trade.PnL > 0 {
+						analysis.LastTakeProfitTime = action.Timestamp
+						timeSince := time.Since(action.Timestamp)
+						analysis.TimeSinceLastTakeProfit = int(timeSince.Minutes())
+						goto foundLastTakeProfit
+					}
+				}
+			}
+		}
+	}
+foundLastTakeProfit:
+
+	// 计算单日亏损百分比（从今天0点开始的所有交易）
+	today := time.Now().Truncate(24 * time.Hour)
+	var dailyPnL float64 = 0.0
+	var initialEquity float64 = 0.0
+	// 获取今天0点时的账户净值（从记录中查找）
+	for _, record := range records {
+		if record.Timestamp.After(today) || record.Timestamp.Equal(today) {
+			// 计算今天的交易盈亏
+			for _, trade := range analysis.RecentTrades {
+				if trade.CloseTime.After(today) || trade.CloseTime.Equal(today) {
+					dailyPnL += trade.PnL
+				}
+			}
+			// 获取今天0点时的账户净值（使用第一个记录）
+			if initialEquity == 0 && len(records) > 0 {
+				// 尝试从记录中获取初始净值
+				// 如果记录中有TotalBalance，使用它；否则使用当前净值减去今天的盈亏
+				if record.AccountState.TotalBalance > 0 {
+					initialEquity = record.AccountState.TotalBalance - dailyPnL
+				}
+			}
+		}
+	}
+	// 如果无法从记录中获取初始净值，使用当前净值减去今天的盈亏来估算
+	if initialEquity <= 0 && len(records) > 0 {
+		latestRecord := records[len(records)-1]
+		if latestRecord.AccountState.TotalBalance > 0 {
+			initialEquity = latestRecord.AccountState.TotalBalance - dailyPnL
+		}
+	}
+	// 计算单日亏损百分比
+	if initialEquity > 0 && dailyPnL < 0 {
+		analysis.DailyLossPercent = (dailyPnL / initialEquity) * 100
+	} else {
+		analysis.DailyLossPercent = 0.0
 	}
 
 	// 计算夏普比率（需要至少2个数据点）

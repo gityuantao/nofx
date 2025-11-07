@@ -1,6 +1,7 @@
 package trader
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -641,6 +643,22 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		}
 		updateTime := at.positionFirstSeenTime[posKey]
 
+		// 获取止损/止盈价格
+		stopLossPrice, takeProfitPrice := at.getStopLossTakeProfitPrices(symbol, side)
+
+		// 追踪最高盈利
+		at.peakPnLCacheMutex.Lock()
+		if currentMax, exists := at.peakPnLCache[posKey]; exists {
+			if pnlPct > currentMax {
+				at.peakPnLCache[posKey] = pnlPct
+			}
+		} else {
+			// 新持仓，初始化最高盈利
+			at.peakPnLCache[posKey] = pnlPct
+		}
+		maxProfitPct := at.peakPnLCache[posKey]
+		at.peakPnLCacheMutex.Unlock()
+
 		positionInfos = append(positionInfos, decision.PositionInfo{
 			Symbol:           symbol,
 			Side:             side,
@@ -653,6 +671,9 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 			LiquidationPrice: liquidationPrice,
 			MarginUsed:       marginUsed,
 			UpdateTime:       updateTime,
+			StopLossPrice:    stopLossPrice,
+			TakeProfitPrice:  takeProfitPrice,
+			MaxProfitPct:      maxProfitPct,
 		})
 	}
 
@@ -660,6 +681,10 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 	for key := range at.positionFirstSeenTime {
 		if !currentPositionKeys[key] {
 			delete(at.positionFirstSeenTime, key)
+			// 同时清理最高盈利缓存
+			at.peakPnLCacheMutex.Lock()
+			delete(at.peakPnLCache, key)
+			at.peakPnLCacheMutex.Unlock()
 		}
 	}
 
@@ -1632,6 +1657,126 @@ func (at *AutoTrader) GetPeakPnLCache() map[string]float64 {
 		cache[k] = v
 	}
 	return cache
+}
+
+// getStopLossTakeProfitPrices 获取持仓的止损/止盈价格
+func (at *AutoTrader) getStopLossTakeProfitPrices(symbol, side string) (stopLossPrice, takeProfitPrice float64) {
+	// 根据交易所类型获取订单信息
+	switch at.exchange {
+	case "binance":
+		return at.getBinanceStopLossTakeProfitPrices(symbol, side)
+	case "aster":
+		return at.getAsterStopLossTakeProfitPrices(symbol, side)
+	case "hyperliquid":
+		// Hyperliquid 暂不支持获取订单详情，返回0
+		return 0, 0
+	default:
+		return 0, 0
+	}
+}
+
+// getBinanceStopLossTakeProfitPrices 从币安获取止损/止盈价格
+func (at *AutoTrader) getBinanceStopLossTakeProfitPrices(symbol, side string) (stopLossPrice, takeProfitPrice float64) {
+	// 使用类型断言获取币安交易器
+	binanceTrader, ok := at.trader.(*FuturesTrader)
+	if !ok {
+		return 0, 0
+	}
+
+	// 获取未完成订单
+	orders, err := binanceTrader.client.NewListOpenOrdersService().
+		Symbol(symbol).
+		Do(context.Background())
+	if err != nil {
+		// 获取失败不影响主流程，只记录日志
+		return 0, 0
+	}
+
+	positionSide := "LONG"
+	if side == "short" {
+		positionSide = "SHORT"
+	}
+
+	// 查找止损和止盈订单
+	for _, order := range orders {
+		// 检查订单方向是否匹配
+		if string(order.PositionSide) != positionSide {
+			continue
+		}
+
+		// 检查订单类型
+		orderType := string(order.Type)
+		if orderType == "STOP_MARKET" || orderType == "STOP" {
+			// 止损单
+			if stopPrice, err := strconv.ParseFloat(order.StopPrice, 64); err == nil {
+				stopLossPrice = stopPrice
+			}
+		} else if orderType == "TAKE_PROFIT_MARKET" || orderType == "TAKE_PROFIT" {
+			// 止盈单
+			if tpPrice, err := strconv.ParseFloat(order.StopPrice, 64); err == nil {
+				takeProfitPrice = tpPrice
+			}
+		}
+	}
+
+	return stopLossPrice, takeProfitPrice
+}
+
+// getAsterStopLossTakeProfitPrices 从Aster获取止损/止盈价格
+func (at *AutoTrader) getAsterStopLossTakeProfitPrices(symbol, side string) (stopLossPrice, takeProfitPrice float64) {
+	// 使用类型断言获取Aster交易器
+	asterTrader, ok := at.trader.(*AsterTrader)
+	if !ok {
+		return 0, 0
+	}
+
+	// 获取未完成订单
+	params := map[string]interface{}{
+		"symbol": symbol,
+	}
+	body, err := asterTrader.request("GET", "/fapi/v3/openOrders", params)
+	if err != nil {
+		return 0, 0
+	}
+
+	var orders []map[string]interface{}
+	if err := json.Unmarshal(body, &orders); err != nil {
+		return 0, 0
+	}
+
+	positionSide := "LONG"
+	if side == "short" {
+		positionSide = "SHORT"
+	}
+
+	// 查找止损和止盈订单
+	for _, order := range orders {
+		// 检查订单方向是否匹配
+		orderPositionSide, _ := order["positionSide"].(string)
+		if orderPositionSide != positionSide && orderPositionSide != "BOTH" {
+			continue
+		}
+
+		// 检查订单类型
+		orderType, _ := order["type"].(string)
+		if orderType == "STOP_MARKET" || orderType == "STOP" {
+			// 止损单
+			if stopPriceStr, ok := order["stopPrice"].(string); ok {
+				if stopPrice, err := strconv.ParseFloat(stopPriceStr, 64); err == nil {
+					stopLossPrice = stopPrice
+				}
+			}
+		} else if orderType == "TAKE_PROFIT_MARKET" || orderType == "TAKE_PROFIT" {
+			// 止盈单
+			if tpPriceStr, ok := order["stopPrice"].(string); ok {
+				if tpPrice, err := strconv.ParseFloat(tpPriceStr, 64); err == nil {
+					takeProfitPrice = tpPrice
+				}
+			}
+		}
+	}
+
+	return stopLossPrice, takeProfitPrice
 }
 
 // UpdatePeakPnL 更新最高收益缓存

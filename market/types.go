@@ -8,19 +8,51 @@ type Data struct {
 	CurrentPrice      float64
 	PriceChange1h     float64 // 1小时价格变化百分比
 	PriceChange4h     float64 // 4小时价格变化百分比
+	PriceChange24h    float64 // 24小时价格变化百分比（单日波动率）
+	Volatility1h      float64 // 1小时波动率（用于检查是否<1%持续1小时）
+	IntegerLevelDistance float64 // 距离最近整数关口的百分比（用于BTC状态检查）
+	IsNearIntegerLevel bool   // 是否处于整数关口±2%（用于BTC状态检查）
+	IsKeyLevelBreakout bool   // 是否刚突破/跌破关键技术位（用于BTC状态检查）
 	CurrentEMA20      float64
+	CurrentEMA50      float64 // 3分钟周期EMA50
 	CurrentMACD       float64
 	CurrentRSI7       float64
 	OpenInterest      *OIData
 	FundingRate       float64
+	BuySellRatio      float64 // 买卖压力比 (TakerBuyVolume / TotalVolume)
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
+	// 15分钟周期数据
+	EMA20_15m         float64
+	EMA50_15m         float64 // 15分钟周期EMA50
+	MACD_15m          float64
+	RSI_15m           float64
+	RSI14_15m         float64 // 15分钟14周期RSI
+	Volume_15m        float64 // 15分钟当前成交量
+	AvgVolume_15m     float64 // 15分钟平均成交量
+	ATR3_15m          float64 // 15分钟3周期ATR
+	ATR14_15m         float64 // 15分钟14周期ATR
+	// 1小时周期数据
+	EMA20_1h          float64
+	EMA50_1h          float64 // 1小时周期EMA50
+	MACD_1h           float64
+	RSI_1h            float64
+	RSI14_1h          float64 // 1小时14周期RSI
+	Volume_1h         float64 // 1小时当前成交量
+	AvgVolume_1h      float64 // 1小时平均成交量
+	ATR3_1h           float64 // 1小时3周期ATR
+	ATR14_1h          float64 // 1小时14周期ATR
+	// 当前K线数据（用于形态分析）
+	CurrentKline3m    *Kline // 当前3分钟K线
+	CurrentKline15m   *Kline // 当前15分钟K线
+	CurrentKline1h    *Kline // 当前1小时K线
 }
 
 // OIData Open Interest数据
 type OIData struct {
-	Latest  float64
-	Average float64
+	Latest       float64
+	Average      float64
+	DeltaPercent float64 // OI持仓量变化百分比
 }
 
 // IntradayData 日内数据(3分钟间隔)
@@ -30,6 +62,10 @@ type IntradayData struct {
 	MACDValues  []float64
 	RSI7Values  []float64
 	RSI14Values []float64
+	Volumes     []float64 // 成交量序列
+	ATR3        float64   // 3周期ATR
+	ATR14       float64   // 14周期ATR
+	RecentKlines []Kline  // 最近3根K线的完整数据（用于计算实体大小）
 }
 
 // LongerTermData 长期数据(4小时时间框架)
@@ -42,6 +78,12 @@ type LongerTermData struct {
 	AverageVolume float64
 	MACDValues    []float64
 	RSI14Values   []float64
+	RecentKlines  []Kline  // 最近5-10根K线（用于形态识别）
+	RecentHigh    float64  // 前高（最近一段时间内的最高价）
+	RecentLow     float64  // 前低（最近一段时间内的最低价）
+	FibonacciLevels []float64 // 斐波那契回撤位（23.6%, 38.2%, 50%, 61.8%, 78.6%）
+	ATRUpperBand  float64   // ATR波动带上轨
+	ATRLowerBand  float64   // ATR波动带下轨
 }
 
 // Binance API 响应结构
