@@ -100,16 +100,16 @@ type AutoTrader struct {
 	lastResetTime         time.Time
 	stopUntil             time.Time
 	isRunning             bool
-	startTime             time.Time        // 系统启动时间
-	callCount             int              // AI调用次数
-	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
-	stopMonitorCh         chan struct{}    // 用于停止监控goroutine
-	monitorWg             sync.WaitGroup   // 用于等待监控goroutine结束
-	peakPnLCache      map[string]float64 	 // 最高收益缓存 (symbol -> 峰值盈亏百分比)
-	peakPnLCacheMutex sync.RWMutex // 缓存读写锁
-	lastBalanceSyncTime   time.Time        // 上次余额同步时间
-	database              interface{}      // 数据库引用（用于自动更新余额）
-	userID                string           // 用户ID
+	startTime             time.Time          // 系统启动时间
+	callCount             int                // AI调用次数
+	positionFirstSeenTime map[string]int64   // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	stopMonitorCh         chan struct{}      // 用于停止监控goroutine
+	monitorWg             sync.WaitGroup     // 用于等待监控goroutine结束
+	peakPnLCache          map[string]float64 // 最高收益缓存 (symbol -> 峰值盈亏百分比)
+	peakPnLCacheMutex     sync.RWMutex       // 缓存读写锁
+	lastBalanceSyncTime   time.Time          // 上次余额同步时间
+	database              interface{}        // 数据库引用（用于自动更新余额）
+	userID                string             // 用户ID
 }
 
 // NewAutoTrader 创建自动交易器
@@ -443,7 +443,7 @@ func (at *AutoTrader) runCycle() error {
 		})
 	}
 
-						log.Print(strings.Repeat("=", 70))
+	log.Print(strings.Repeat("=", 70))
 	for _, coin := range ctx.CandidateCoins {
 		record.CandidateCoins = append(record.CandidateCoins, coin.Symbol)
 	}
@@ -472,11 +472,11 @@ func (at *AutoTrader) runCycle() error {
 
 		// 打印系统提示词和AI思维链（即使有错误，也要输出以便调试）
 		if decision != nil {
-				log.Print("\n" + strings.Repeat("=", 70) + "\n")
-				log.Printf("📋 系统提示词 [模板: %s] (错误情况)", at.systemPromptTemplate)
-				log.Println(strings.Repeat("=", 70))
-				log.Println(decision.SystemPrompt)
-				log.Println(strings.Repeat("=", 70))
+			log.Print("\n" + strings.Repeat("=", 70) + "\n")
+			log.Printf("📋 系统提示词 [模板: %s] (错误情况)", at.systemPromptTemplate)
+			log.Println(strings.Repeat("=", 70))
+			log.Println(decision.SystemPrompt)
+			log.Println(strings.Repeat("=", 70))
 
 			if decision.CoTTrace != "" {
 				log.Print("\n" + strings.Repeat("-", 70) + "\n")
@@ -515,9 +515,9 @@ func (at *AutoTrader) runCycle() error {
 	//     }
 	// }
 	log.Println()
-				log.Print(strings.Repeat("-", 70))
+	log.Print(strings.Repeat("-", 70))
 	// 8. 对决策排序：确保先平仓后开仓（防止仓位叠加超限）
-				log.Print(strings.Repeat("-", 70))
+	log.Print(strings.Repeat("-", 70))
 
 	// 8. 对决策排序：确保先平仓后开仓（防止仓位叠加超限）
 	sortedDecisions := sortDecisionsByPriority(decision.Decisions)
@@ -673,7 +673,7 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 			UpdateTime:       updateTime,
 			StopLossPrice:    stopLossPrice,
 			TakeProfitPrice:  takeProfitPrice,
-			MaxProfitPct:      maxProfitPct,
+			MaxProfitPct:     maxProfitPct,
 		})
 	}
 
@@ -833,6 +833,16 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
+	// 获取当前价格，验证止损价格合理性
+	marketData, err2 := market.Get(decision.Symbol)
+	if err2 == nil {
+		// 验证做多止损：止损必须低于当前价格
+		if decision.StopLoss >= marketData.CurrentPrice {
+			log.Printf("  ⚠ 警告：做多止损价格 (%.2f) 高于或等于当前价格 (%.2f)，可能导致立即触发！", decision.StopLoss, marketData.CurrentPrice)
+			log.Printf("  ⚠ 建议：检查止损价格设置是否正确")
+		}
+	}
+
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "LONG", quantity, decision.StopLoss); err != nil {
 		log.Printf("  ⚠ 设置止损失败: %v", err)
@@ -912,6 +922,16 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// 记录开仓时间
 	posKey := decision.Symbol + "_short"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
+
+	// 获取当前价格，验证止损价格合理性
+	marketData, err2 := market.Get(decision.Symbol)
+	if err2 == nil {
+		// 验证做空止损：止损必须高于当前价格
+		if decision.StopLoss <= marketData.CurrentPrice {
+			log.Printf("  ⚠ 警告：做空止损价格 (%.2f) 低于或等于当前价格 (%.2f)，可能导致立即触发！", decision.StopLoss, marketData.CurrentPrice)
+			log.Printf("  ⚠ 建议：检查止损价格设置是否正确")
+		}
+	}
 
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "SHORT", quantity, decision.StopLoss); err != nil {

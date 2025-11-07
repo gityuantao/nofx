@@ -427,22 +427,31 @@ func buildUserPrompt(ctx *Context, majorEvents string) string {
 				sb.WriteString(" ✅ 不在整数关口附近\n")
 			}
 		}
-		// 单日波动率
+		// 单日波动率（用于第2.5步：极端行情保护）
 		if btcData.PriceChange24h != 0 {
-			sb.WriteString(fmt.Sprintf("- 单日波动率: %.2f%%", math.Abs(btcData.PriceChange24h)))
-			if math.Abs(btcData.PriceChange24h) > 5.0 {
+			abs24hVol := math.Abs(btcData.PriceChange24h)
+			sb.WriteString(fmt.Sprintf("- 单日波动率: %.2f%%", abs24hVol))
+			if abs24hVol > 15.0 {
+				sb.WriteString(" ❌ **单日波动 >15%（异常波动，暂停交易 12 小时）**\n")
+			} else if abs24hVol > 5.0 {
 				sb.WriteString(" ❌ **单日波动 >5%（市场剧烈震荡）**\n")
 			} else {
 				sb.WriteString(" ✅ 单日波动 ≤5%\n")
 			}
 		}
-		// 1小时波动率
+		// 1小时波动率（用于第2.5步：极端行情保护）
 		if btcData.Volatility1h > 0 {
 			sb.WriteString(fmt.Sprintf("- 1小时波动率: %.2f%%", btcData.Volatility1h))
-			if btcData.Volatility1h < 1.0 {
+			if btcData.Volatility1h > 10.0 {
+				sb.WriteString(" ❌ **1小时波动 >10%（极端波动，暂停新开仓，只允许持仓管理）**\n")
+			} else if btcData.Volatility1h < 0.3 {
+				sb.WriteString(" ❌ **1小时波动 <0.3%（极端震荡，暂停新开仓，等待突破）**\n")
+			} else if btcData.Volatility1h < 1.0 {
 				sb.WriteString(" ⚠️ **1小时波动 <1%（极端震荡，连续wait≥30次时需要检查）**\n")
+			} else if btcData.Volatility1h >= 0.5 && btcData.Volatility1h <= 5.0 {
+				sb.WriteString(" ✅ 1小时波动正常（0.5%-5%，市场环境正常）\n")
 			} else {
-				sb.WriteString(" ✅ 1小时波动 ≥1%\n")
+				sb.WriteString(" ⚠️ 1小时波动异常（不在正常范围 0.5%-5%）\n")
 			}
 		}
 		// 关键技术位突破状态
@@ -586,6 +595,7 @@ func buildUserPrompt(ctx *Context, majorEvents string) string {
 			TimeSinceLastTakeProfit int                      `json:"time_since_last_take_profit"`
 			DailyLossPercent       float64                   `json:"daily_loss_percent"`
 			RecentDecisions        []map[string]interface{}  `json:"recent_decisions"`
+			RecentTrades           []map[string]interface{}  `json:"recent_trades"` // 最近交易历史（用于评分验证）
 		}
 		var perfData PerformanceData
 		if jsonData, err := json.Marshal(ctx.Performance); err == nil {
@@ -712,6 +722,13 @@ func buildUserPrompt(ctx *Context, majorEvents string) string {
 					sb.WriteString(fmt.Sprintf("单日亏损百分比: %.2f%%（今日盈利或持平）\n", perfData.DailyLossPercent))
 				}
 
+				// 输出单日回撤百分比（重要：用于第2步连续亏损检查，优化后新增）
+				// 注意：如果 PerformanceAnalysis 中有 DailyDrawdownPercent 字段，则使用；否则使用 DailyLossPercent 作为近似值
+				dailyDrawdown := perfData.DailyLossPercent
+				if dailyDrawdown < 0 && math.Abs(dailyDrawdown) > 3.0 {
+					sb.WriteString(fmt.Sprintf("单日回撤百分比: %.2f%% ⚠️ **单日回撤 >3%，暂停交易 6 小时，重新评估策略**\n", math.Abs(dailyDrawdown)))
+				}
+
 				// 输出最近决策历史（用于判断连续wait和恢复条件）
 				if len(perfData.RecentDecisions) > 0 {
 					sb.WriteString("\n最近决策历史（最新 → 最旧）:\n")
@@ -740,6 +757,76 @@ func buildUserPrompt(ctx *Context, majorEvents string) string {
 						}
 					}
 				}
+
+				// 输出最近交易历史（用于评分验证机制，优化后新增）
+				if len(perfData.RecentTrades) > 0 {
+					sb.WriteString("\n最近交易历史（用于评分验证，最新 → 最旧）:\n")
+					maxShow := 5 // 只显示最近 5 笔
+					if len(perfData.RecentTrades) < maxShow {
+						maxShow = len(perfData.RecentTrades)
+					}
+					for i := 0; i < maxShow; i++ {
+						trade := perfData.RecentTrades[i]
+						symbol := ""
+						side := ""
+						pnLPct := 0.0
+						confidence := 0
+						
+						if s, ok := trade["symbol"].(string); ok {
+							symbol = s
+						}
+						if s, ok := trade["side"].(string); ok {
+							side = s
+						}
+						if p, ok := trade["pn_l_pct"].(float64); ok {
+							pnLPct = p
+						}
+						if c, ok := trade["confidence"].(float64); ok {
+							confidence = int(c)
+						} else if c, ok := trade["confidence"].(int); ok {
+							confidence = c
+						}
+						
+						result := "盈利"
+						if pnLPct < 0 {
+							result = "亏损"
+						}
+						
+						confidenceStr := ""
+						if confidence > 0 {
+							confidenceStr = fmt.Sprintf(" | 信心度: %d", confidence)
+						}
+						
+						sb.WriteString(fmt.Sprintf("  %d. %s %s | PnL: %.2f%% (%s)%s\n", 
+							i+1, symbol, strings.ToUpper(side), pnLPct, result, confidenceStr))
+					}
+					
+					// 评分验证提示
+					failedHighConfidenceCount := 0
+					for i := 0; i < maxShow && i < len(perfData.RecentTrades); i++ {
+						trade := perfData.RecentTrades[i]
+						pnLPct := 0.0
+						confidence := 0
+						
+						if p, ok := trade["pn_l_pct"].(float64); ok {
+							pnLPct = p
+						}
+						if c, ok := trade["confidence"].(float64); ok {
+							confidence = int(c)
+						} else if c, ok := trade["confidence"].(int); ok {
+							confidence = c
+						}
+						
+						if pnLPct < 0 && confidence >= 90 {
+							failedHighConfidenceCount++
+						}
+					}
+					
+					if failedHighConfidenceCount >= 3 {
+						sb.WriteString(fmt.Sprintf("⚠️ **评分验证警告**：连续 %d 笔交易失败但信心度都 ≥90，说明评分虚高，需重新评估评分标准\n", failedHighConfidenceCount))
+					}
+				}
+				
 				sb.WriteString("\n")
 			}
 		}

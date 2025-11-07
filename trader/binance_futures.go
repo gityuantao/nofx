@@ -33,7 +33,7 @@ type FuturesTrader struct {
 // NewFuturesTrader 创建合约交易器
 func NewFuturesTrader(apiKey, secretKey string, testnet bool) *FuturesTrader {
 	client := futures.NewClient(apiKey, secretKey)
-	
+
 	// 设置测试网 BaseURL
 	if testnet {
 		client.BaseURL = "https://testnet.binancefuture.com"
@@ -41,7 +41,7 @@ func NewFuturesTrader(apiKey, secretKey string, testnet bool) *FuturesTrader {
 	} else {
 		log.Printf("✓ 使用币安主网")
 	}
-	
+
 	// 同步时间，避免 Timestamp ahead 错误
 	syncBinanceServerTime(client)
 	trader := &FuturesTrader{
@@ -500,8 +500,6 @@ func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]
 	return result, nil
 }
 
-
-
 // CancelStopLossOrders 仅取消止损单（不影响止盈单）
 func (t *FuturesTrader) CancelStopLossOrders(symbol string) error {
 	// 获取该币种的所有未完成订单
@@ -703,19 +701,15 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		posSide = futures.PositionSideTypeShort
 	}
 
-	// 格式化数量
-	quantityStr, err := t.FormatQuantity(symbol, quantity)
-	if err != nil {
-		return err
-	}
-
-	_, err = t.client.NewCreateOrderService().
+	// ⚠️ 重要：使用 ClosePosition(true) 时，不能同时指定 Quantity
+	// 币安会自动使用当前持仓数量，如果同时指定会导致订单被拒绝或取消
+	// 注意：quantity 参数保留用于接口兼容性，但实际不使用
+	_, err := t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.OrderTypeStopMarket).
 		StopPrice(fmt.Sprintf("%.8f", stopPrice)).
-		Quantity(quantityStr).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
 		Do(context.Background())
@@ -741,19 +735,15 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		posSide = futures.PositionSideTypeShort
 	}
 
-	// 格式化数量
-	quantityStr, err := t.FormatQuantity(symbol, quantity)
-	if err != nil {
-		return err
-	}
-
-	_, err = t.client.NewCreateOrderService().
+	// ⚠️ 重要：使用 ClosePosition(true) 时，不能同时指定 Quantity
+	// 币安会自动使用当前持仓数量，如果同时指定会导致订单被拒绝或取消
+	// 注意：quantity 参数保留用于接口兼容性，但实际不使用
+	_, err := t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.OrderTypeTakeProfitMarket).
 		StopPrice(fmt.Sprintf("%.8f", takeProfitPrice)).
-		Quantity(quantityStr).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
 		Do(context.Background())
