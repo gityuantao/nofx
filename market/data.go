@@ -111,8 +111,9 @@ func Get(symbol string) (*Data, error) {
 		// 找到最近的整数关口
 		nearestLevel := integerLevels[0]
 		integerLevelDistance = math.Abs((currentPrice - nearestLevel) / currentPrice) * 100
-		// 检查是否处于整数关口±2%
-		if integerLevelDistance <= 2.0 {
+		// 检查是否处于整数关口±1%（优化：从±2%收紧为±1%，减少误判）
+		// 注意：在宽松模式下，AI会根据提示词规则进一步放宽此限制
+		if integerLevelDistance <= 1.0 {
 			isNearIntegerLevel = true
 		}
 	}

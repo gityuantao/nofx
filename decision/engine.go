@@ -416,7 +416,13 @@ func buildUserPrompt(ctx *Context, majorEvents string) string {
 		if btcData.IntegerLevelDistance < 999 {
 			sb.WriteString(fmt.Sprintf("- 整数关口距离: %.2f%%", btcData.IntegerLevelDistance))
 			if btcData.IsNearIntegerLevel {
-				sb.WriteString(" ❌ **处于整数关口±2%（高度不确定）**\n")
+				sb.WriteString(" ❌ **处于整数关口±1%（高度不确定，正常模式禁止开仓）**\n")
+				// 提示宽松模式下的规则
+				if btcData.IntegerLevelDistance <= 2.0 && btcData.IntegerLevelDistance > 1.0 {
+					sb.WriteString("  ⚠️ 距离1-2%：在宽松模式下可接受（需多周期趋势一致）\n")
+				}
+			} else if btcData.IntegerLevelDistance <= 2.0 && btcData.IntegerLevelDistance > 1.0 {
+				sb.WriteString(" ⚠️ **距离1-2%（宽松模式下可接受）**\n")
 			} else {
 				sb.WriteString(" ✅ 不在整数关口附近\n")
 			}
